@@ -1,7 +1,10 @@
-BOT_TOKEN = "8847437983:AAEe-88qYV3GjUYpJ7b5VEghwdxXIwlYW5w"
-GROQ_API_KEY = "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"
-GROQ_MODEL = "llama3-70b-8192"
+import os
 
-DB_PATH = "baffy.db"
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-70b-8192")
 
-SUPERADMIN_ID = 8415937480
+SUPERADMIN_ID = int(os.environ.get("SUPERADMIN_ID", "0"))
+
+# Railway Volume path (IMPORTANT)
+DB_PATH = os.getenv("DB_PATH", "/data/baffy.db")
