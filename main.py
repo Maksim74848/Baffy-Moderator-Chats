@@ -2,11 +2,13 @@ import telebot
 import json
 
 from config import BOT_TOKEN
+from db import (
+    save_message,
+    add_xp,
+    add_coins,
+    update_chaos
+)
 from brain import ask_baffy, build_context
-from db import save_message, add_xp
-from economy import add_coins
-from classes import assign_class
-from world import update_chaos
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -24,37 +26,27 @@ def handle(m):
 
     ai = ask_baffy(chat_id, user_id, text, context)
 
-    # XP
+    # XP + COINS
     add_xp(user_id, chat_id, ai.get("xp", 0))
-
-    # COINS
     add_coins(user_id, chat_id, ai.get("coins", 0))
-
-    # CLASS SYSTEM
-    assign_class(user_id, chat_id, context["xp"])
 
     # WORLD CHAOS
     update_chaos(chat_id, ai.get("chaos", 0))
 
-    # ACTIONS
-    if ai["action"] in ["message", "event", "world_event"]:
-        bot.send_message(chat_id, ai.get("text", ""))
+    # RESPONSE
+    if ai.get("text"):
+        bot.send_message(chat_id, ai["text"])
 
-    elif ai["action"] == "reward":
-        bot.send_message(chat_id, f"✨ +XP +Coins")
+    # EVENTS
+    if ai["action"] == "event":
+        bot.send_message(chat_id, "🎲 " + ai.get("text", "Event"))
 
-    elif ai["action"] == "game":
-        if ai.get("game") == "mafia":
-            bot.send_message(chat_id, "🕵️ Мафия началась!")
-        elif ai.get("game") == "crocodile":
-            bot.send_message(chat_id, "🎭 Крокодил старт!")
-        else:
-            bot.send_message(chat_id, "❓ Викторина")
+    if ai["action"] == "game":
+        bot.send_message(chat_id, f"🎮 Game started: {ai.get('game')}")
 
-    elif ai["action"] == "punishment":
-        bot.send_message(chat_id, "⚠️ Нарушение зафиксировано")
-import os
+    if ai["action"] == "reward":
+        bot.send_message(chat_id, "✨ Reward given!")
 
-PORT = int(os.environ.get("PORT", 8080))
 
+print("Baffy running on Railway...")
 bot.infinity_polling()
