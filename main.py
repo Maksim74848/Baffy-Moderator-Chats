@@ -53,6 +53,8 @@ def handle(m):
 
     elif ai["action"] == "punishment":
         bot.send_message(chat_id, "⚠️ Нарушение зафиксировано")
+import os
 
+PORT = int(os.environ.get("PORT", 8080))
 
 bot.infinity_polling()
