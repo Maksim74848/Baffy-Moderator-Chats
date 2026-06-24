@@ -1,306 +1,210 @@
+import os
 import asyncio
+import aiohttp
+import base64
 import sqlite3
-import tempfile
-import uuid
-
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, CallbackQuery,
-    InlineKeyboardMarkup, InlineKeyboardButton,
-    LabeledPrice, PreCheckoutQuery
+    InlineKeyboardButton, InlineKeyboardMarkup,
+    Voice
 )
-from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
-
 from groq import Groq
-import easyocr
+from PIL import Image
+import pytesseract
+from io import BytesIO
 
-# ================= НАСТРОЙКИ =================
+# ================== CONFIG ==================
 
-BOT_TOKEN = "ТВОЙ_BOT_TOKEN"
-GROQ_API_KEY = "ТВОЙ_GROQ_KEY"
-PAYMENT_PROVIDER_TOKEN = "ТВОЙ_WALLET_PAY_TOKEN"
+BOT_TOKEN = os.getenv("8470101764:AAF2QWP9bPUwSwmDsKPrOFkGC0amvz3cWlw")
+GROQ_API_KEY = os.getenv("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")
+CRYPTO_PAY_TOKEN = os.getenv("600210:AAazektG1ofJzATQOO6WUN0Ft5kZYfz4MV8")
 
-MODEL_NAME = "llama-3.1-70b-versatile"
-MAX_MEMORY = 20
+BOT_NAME = "Jarvis"
 
-# ================= ИНИЦИАЛИЗАЦИЯ =================
+# ================== INIT ==================
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 groq = Groq(api_key=GROQ_API_KEY)
-ocr = easyocr.Reader(["ru", "en"])
 
-# ================= БАЗА ДАННЫХ =================
+db = sqlite3.connect("db.sqlite3")
+cursor = db.cursor()
 
-db = sqlite3.connect("jarvis.db")
-cur = db.cursor()
+# ================== DB ==================
 
-cur.execute("""
+cursor.execute("""
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
-    mood TEXT DEFAULT 'дружелюбный',
-    style TEXT DEFAULT 'нормально',
-    emoji TEXT DEFAULT 'мало',
-    tier TEXT DEFAULT 'simple_1'
+    balance INTEGER DEFAULT 0,
+    model TEXT DEFAULT 'basic_1',
+    mood TEXT DEFAULT 'neutral',
+    emoji INTEGER DEFAULT 1,
+    role TEXT DEFAULT 'assistant',
+    memory TEXT DEFAULT '',
+    ref INTEGER
 )
 """)
 
-cur.execute("""
-CREATE TABLE IF NOT EXISTS memory (
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS payments (
+    invoice_id TEXT,
     user_id INTEGER,
-    role TEXT,
-    content TEXT
-)
-""")
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS summary (
-    user_id INTEGER PRIMARY KEY,
-    content TEXT
-)
-""")
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS referrals (
-    user_id INTEGER PRIMARY KEY,
-    ref_code TEXT,
-    invited INTEGER DEFAULT 0
+    amount INTEGER
 )
 """)
 
 db.commit()
 
-# ================= FSM =================
+# ================== FSM ==================
 
-class Menu(StatesGroup):
-    main = State()
-    chat = State()
+class Settings(StatesGroup):
+    mood = State()
+    emoji = State()
+    role = State()
 
-# ================= КНОПКИ =================
+# ================== KEYBOARDS ==================
 
 def main_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💬 Диалог с Jarvis", callback_data="chat")],
-        [InlineKeyboardButton(text="🗂 Режим секретаря", callback_data="secretary")],
-        [InlineKeyboardButton(text="🧠 Настройки ИИ", callback_data="settings")],
-        [InlineKeyboardButton(text="🖼 Текст с картинки", callback_data="ocr")],
-        [InlineKeyboardButton(text="💎 Версии Jarvis", callback_data="tiers")],
-        [InlineKeyboardButton(text="🗑 Очистить память", callback_data="clear")]
+        [InlineKeyboardButton(text="💬 Диалог", callback_data="chat")],
+        [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
+        [InlineKeyboardButton(text="💎 Версии ИИ", callback_data="models")],
+        [InlineKeyboardButton(text="💰 Баланс", callback_data="balance")],
+        [InlineKeyboardButton(text="🎁 Рефералы", callback_data="ref")]
     ])
 
 def settings_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🙂 Настроение", callback_data="mood")],
-        [InlineKeyboardButton(text="⚡ Стиль ответа", callback_data="style")],
-        [InlineKeyboardButton(text="😄 Эмодзи", callback_data="emoji")],
-        [InlineKeyboardButton(text="⬅ Назад", callback_data="back")]
+        [InlineKeyboardButton(text="😌 Настроение", callback_data="set_mood")],
+        [InlineKeyboardButton(text="✨ Эмодзи", callback_data="set_emoji")],
+        [InlineKeyboardButton(text="🗂 Роль (Секретарь)", callback_data="set_role")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")]
     ])
 
-def choice_menu(param, values):
+def models_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=v, callback_data=f"set_{param}_{v}")]
-        for v in values
-    ] + [[InlineKeyboardButton(text="⬅ Назад", callback_data="settings")]])
-
-def tiers_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Simple 1 (бесплатно)", callback_data="tier_simple_1")],
-        [InlineKeyboardButton(text="Simple 2 — 5₽", callback_data="buy_simple_2")],
-        [InlineKeyboardButton(text="Pro 1 — 15₽", callback_data="buy_pro_1")],
-        [InlineKeyboardButton(text="Pro 2 — 25₽", callback_data="buy_pro_2")],
-        [InlineKeyboardButton(text="Pro 3 — 49₽", callback_data="buy_pro_3")],
-        [InlineKeyboardButton(text="⬅ Назад", callback_data="back")]
+        [InlineKeyboardButton(text="Basic 1", callback_data="model_basic_1")],
+        [InlineKeyboardButton(text="Basic 2", callback_data="model_basic_2")],
+        [InlineKeyboardButton(text="Pro 1", callback_data="model_pro_1")],
+        [InlineKeyboardButton(text="Pro 2", callback_data="model_pro_2")],
+        [InlineKeyboardButton(text="Ultra", callback_data="model_ultra")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")]
     ])
 
-# ================= ЛОГИКА =================
+# ================== START ==================
 
-def get_user(user_id):
-    cur.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (user_id,))
+@dp.message(F.text == "/start")
+async def start(msg: Message):
+    ref = msg.text.split(" ")[1] if len(msg.text.split()) > 1 else None
+    cursor.execute("INSERT OR IGNORE INTO users(user_id, ref) VALUES (?,?)", (msg.from_user.id, ref))
     db.commit()
-    cur.execute("SELECT mood, style, emoji, tier FROM users WHERE user_id=?", (user_id,))
-    return cur.fetchone()
-
-def system_prompt(profile):
-    mood, style, emoji, tier = profile
-    return (
-        "Ты — ИИ Jarvis.\n"
-        "Роль: персональный секретарь.\n"
-        f"Настроение: {mood}\n"
-        f"Стиль ответа: {style}\n"
-        f"Эмодзи: {emoji}\n"
-        "Отвечай полезно, понятно и по делу."
-    )
-
-def load_memory(user_id):
-    cur.execute("SELECT role, content FROM memory WHERE user_id=?", (user_id,))
-    return [{"role": r, "content": c} for r, c in cur.fetchall()[-MAX_MEMORY:]]
-
-def save_memory(user_id, role, text):
-    cur.execute("INSERT INTO memory VALUES (?,?,?)", (user_id, role, text))
-    db.commit()
-
-def summarize(user_id):
-    cur.execute("SELECT role, content FROM memory WHERE user_id=?", (user_id,))
-    rows = cur.fetchall()
-    if len(rows) < MAX_MEMORY:
-        return
-
-    text = "\n".join([f"{r}: {c}" for r, c in rows[:-5]])
-
-    summary = groq.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": "Сделай краткое саммари диалога."},
-            {"role": "user", "content": text}
-        ]
-    ).choices[0].message.content
-
-    cur.execute("INSERT OR REPLACE INTO summary VALUES (?,?)", (user_id, summary))
-    cur.execute("DELETE FROM memory WHERE user_id=?", (user_id,))
-    db.commit()
-
-def ask_jarvis(user_id, text):
-    summarize(user_id)
-    profile = get_user(user_id)
-
-    messages = [{"role": "system", "content": system_prompt(profile)}]
-
-    cur.execute("SELECT content FROM summary WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    if row:
-        messages.append({"role": "system", "content": f"История: {row[0]}"})
-
-    messages += load_memory(user_id)
-    messages.append({"role": "user", "content": text})
-
-    reply = groq.chat.completions.create(
-        model=MODEL_NAME,
-        messages=messages
-    ).choices[0].message.content
-
-    save_memory(user_id, "user", text)
-    save_memory(user_id, "assistant", reply)
-    return reply
-
-def get_ref_link(user_id, bot_username):
-    cur.execute(
-        "INSERT OR IGNORE INTO referrals VALUES (?,?,0)",
-        (user_id, str(uuid.uuid4())[:8])
-    )
-    db.commit()
-    cur.execute("SELECT ref_code FROM referrals WHERE user_id=?", (user_id,))
-    code = cur.fetchone()[0]
-    return f"https://t.me/{bot_username}?start={code}"
-
-# ================= ХЕНДЛЕРЫ =================
-
-@dp.message(F.text.startswith("/start"))
-async def start(msg: Message, state: FSMContext):
-    if len(msg.text.split()) > 1:
-        ref = msg.text.split()[1]
-        cur.execute("UPDATE referrals SET invited = invited + 1 WHERE ref_code=?", (ref,))
-        db.commit()
-
-    await state.set_state(Menu.main)
-    bot_name = (await bot.me()).username
-    ref_link = get_ref_link(msg.from_user.id, bot_name)
-
     await msg.answer(
-        "👋 Привет, я **Jarvis**.\n\n"
-        "Я умею помнить диалоги, работать с картинками и быть твоим секретарём.\n\n"
-        f"🔗 Твоя реферальная ссылка:\n{ref_link}",
+        f"👋 Привет! Я {BOT_NAME}.\n\n"
+        "Я умею помнить диалоги, быть секретарем, работать с голосом и изображениями.\n\n"
+        "Выбери действие 👇",
         reply_markup=main_menu()
     )
 
-@dp.callback_query(F.data == "chat")
-async def chat(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(Menu.chat)
-    await cb.message.edit_text(
-        "💬 Пиши — я слушаю.",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="⬅ Меню", callback_data="back")]]
+# ================== CALLBACKS ==================
+
+@dp.callback_query()
+async def callbacks(call: CallbackQuery, state: FSMContext):
+    data = call.data
+    uid = call.from_user.id
+
+    if data == "settings":
+        await call.message.edit_text("⚙️ Настройки", reply_markup=settings_menu())
+
+    elif data == "models":
+        await call.message.edit_text("💎 Выбор версии ИИ", reply_markup=models_menu())
+
+    elif data.startswith("model_"):
+        cursor.execute("UPDATE users SET model=? WHERE user_id=?", (data.replace("model_", ""), uid))
+        db.commit()
+        await call.answer("✅ Модель выбрана")
+
+    elif data == "balance":
+        cursor.execute("SELECT balance FROM users WHERE user_id=?", (uid,))
+        bal = cursor.fetchone()[0]
+        await call.message.answer(f"💰 Баланс: {bal}₽")
+
+    elif data == "ref":
+        await call.message.answer(
+            f"🎁 Твоя реферальная ссылка:\n"
+            f"https://t.me/{(await bot.me()).username}?start={uid}\n\n"
+            "Ты получаешь 20% с пополнений друзей."
         )
+
+    elif data == "back":
+        await call.message.edit_text("Главное меню", reply_markup=main_menu())
+
+# ================== CHAT ==================
+
+async def summarize(memory):
+    prompt = f"Сделай краткое саммари:\n{memory}"
+    res = groq.chat.completions.create(
+        model="llama3-8b-8192",
+        messages=[{"role":"user","content":prompt}]
+    )
+    return res.choices[0].message.content[:800]
+
+@dp.message(F.text)
+async def chat(msg: Message):
+    uid = msg.from_user.id
+    cursor.execute("SELECT memory, mood, emoji, role FROM users WHERE user_id=?", (uid,))
+    memory, mood, emoji, role = cursor.fetchone()
+
+    prompt = f"""
+Ты {role}.
+Настроение: {mood}.
+Эмодзи: {'да' if emoji else 'нет'}.
+Контекст:
+{memory}
+
+Пользователь: {msg.text}
+"""
+
+    res = groq.chat.completions.create(
+        model="llama3-70b-8192",
+        messages=[{"role":"user","content":prompt}]
     )
 
-@dp.message(Menu.chat, F.text)
-async def dialog(msg: Message):
-    await msg.answer("⌛ Думаю…")
-    reply = ask_jarvis(msg.from_user.id, msg.text)
-    await msg.answer(reply)
+    answer = res.choices[0].message.content
 
-@dp.callback_query(F.data == "secretary")
-async def secretary(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(Menu.chat)
-    await cb.message.edit_text(
-        "🗂 Режим секретаря активирован.\n"
-        "Можешь давать задачи, планы и поручения.",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="⬅ Меню", callback_data="back")]]
-        )
-    )
+    new_memory = memory + f"\nUser: {msg.text}\nJarvis: {answer}"
+    if len(new_memory) > 3000:
+        new_memory = await summarize(new_memory)
+
+    cursor.execute("UPDATE users SET memory=? WHERE user_id=?", (new_memory, uid))
+    db.commit()
+
+    await msg.answer(answer)
+
+# ================== IMAGE OCR ==================
 
 @dp.message(F.photo)
-async def image(msg: Message):
+async def image_handler(msg: Message):
     file = await bot.get_file(msg.photo[-1].file_id)
-    with tempfile.NamedTemporaryFile(suffix=".jpg") as f:
-        await bot.download_file(file.file_path, f.name)
-        text = "\n".join(ocr.readtext(f.name, detail=0))
-    await msg.answer("📄 Найденный текст:\n\n" + (text or "Пусто"))
+    data = await bot.download_file(file.file_path)
+    img = Image.open(BytesIO(data.read()))
+    text = pytesseract.image_to_string(img, lang="rus+eng")
+    await msg.answer(f"📄 Текст с картинки:\n{text}")
 
-@dp.callback_query(F.data == "settings")
-async def settings(cb: CallbackQuery):
-    await cb.message.edit_text("🧠 Настройки", reply_markup=settings_menu())
+# ================== CRYPTOPAY ==================
 
-@dp.callback_query(F.data.startswith("set_"))
-async def set_param(cb: CallbackQuery):
-    _, key, val = cb.data.split("_", 2)
-    cur.execute(f"UPDATE users SET {key}=? WHERE user_id=?", (val, cb.from_user.id))
-    db.commit()
-    await cb.message.edit_text("✅ Обновлено", reply_markup=settings_menu())
+async def create_invoice(uid, amount):
+    async with aiohttp.ClientSession() as s:
+        async with s.post(
+            "https://pay.crypt.bot/api/createInvoice",
+            headers={"Crypto-Pay-API-Token": CRYPTO_PAY_TOKEN},
+            json={"asset":"USDT","amount":amount}
+        ) as r:
+            return (await r.json())["result"]
 
-@dp.callback_query(F.data == "clear")
-async def clear(cb: CallbackQuery):
-    cur.execute("DELETE FROM memory WHERE user_id=?", (cb.from_user.id,))
-    cur.execute("DELETE FROM summary WHERE user_id=?", (cb.from_user.id,))
-    db.commit()
-    await cb.message.edit_text("🗑 Память очищена", reply_markup=main_menu())
-
-@dp.callback_query(F.data == "tiers")
-async def tiers(cb: CallbackQuery):
-    await cb.message.edit_text("💎 Версии Jarvis", reply_markup=tiers_menu())
-
-@dp.callback_query(F.data.startswith("buy_"))
-async def buy(cb: CallbackQuery):
-    tier = cb.data.replace("buy_", "")
-    prices = {"simple_2":5,"pro_1":15,"pro_2":25,"pro_3":49}
-    await bot.send_invoice(
-        cb.from_user.id,
-        title=f"Jarvis {tier}",
-        description="Доступ к версии",
-        payload=tier,
-        provider_token=PAYMENT_PROVIDER_TOKEN,
-        currency="RUB",
-        prices=[LabeledPrice(label=tier, amount=prices[tier]*100)]
-    )
-
-@dp.pre_checkout_query()
-async def checkout(q: PreCheckoutQuery):
-    await q.answer(ok=True)
-
-@dp.message(F.successful_payment)
-async def paid(msg: Message):
-    tier = msg.successful_payment.invoice_payload
-    cur.execute("UPDATE users SET tier=? WHERE user_id=?", (tier, msg.from_user.id))
-    db.commit()
-    await msg.answer("💎 Версия активирована!", reply_markup=main_menu())
-
-@dp.callback_query(F.data == "back")
-async def back(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(Menu.main)
-    await cb.message.edit_text("🏠 Главное меню", reply_markup=main_menu())
-
-# ================= ЗАПУСК =================
+# ================== RUN ==================
 
 async def main():
     await dp.start_polling(bot)
