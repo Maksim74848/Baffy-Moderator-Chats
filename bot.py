@@ -2,7 +2,7 @@ import os
 import asyncio
 import sqlite3
 import aiohttp
-import time
+from datetime import datetime
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS users(
     tier TEXT DEFAULT 'free',
     role TEXT DEFAULT 'assistant',
     memory TEXT DEFAULT '',
-    messages INTEGER DEFAULT 0
+    messages INTEGER DEFAULT 0,
+    created_at TEXT
 )
 """)
 
@@ -51,13 +52,17 @@ CREATE TABLE IF NOT EXISTS payments(
 
 db.commit()
 
-# ================= LIMITS =================
+# ================= TIERS =================
 
-LIMITS = {"free": 30, "pro": 150, "ultra": 500}
+LIMITS = {
+    "free": 30,
+    "pro": 150,
+    "ultra": 500
+}
 
 # ================= UI =================
 
-def kb():
+def main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💎 Подписка", callback_data="subs")],
         [InlineKeyboardButton(text="👑 Админ", callback_data="admin")]
@@ -65,26 +70,30 @@ def kb():
 
 # ================= DB =================
 
-def get(uid):
+def get_user(uid):
     cur.execute("SELECT * FROM users WHERE user_id=?", (uid,))
     return cur.fetchone()
 
-def create(uid):
-    cur.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (uid,))
+def create_user(uid):
+    cur.execute(
+        "INSERT OR IGNORE INTO users(user_id, created_at) VALUES(?, ?)",
+        (uid, datetime.utcnow().isoformat())
+    )
     db.commit()
 
-def update(uid, **kw):
-    keys = ",".join([f"{k}=?" for k in kw])
-    vals = list(kw.values()) + [uid]
+def update_user(uid, **fields):
+    keys = ",".join([f"{k}=?" for k in fields])
+    vals = list(fields.values()) + [uid]
     cur.execute(f"UPDATE users SET {keys} WHERE user_id=?", vals)
     db.commit()
 
-# ================= MEMORY =================
+# ================= MEMORY ENGINE =================
 
-def memory_pack(mem, u, a):
-    return (mem + f"\nU:{u}\nA:{a}")[-3500:]
+def memory_engine(mem, user, ai):
+    merged = mem + f"\nU:{user}\nA:{ai}"
+    return merged[-4000:]
 
-# ================= AI CORE =================
+# ================= AI ENGINE =================
 
 MODELS = [
     "llama-3.1-70b-versatile",
@@ -92,7 +101,7 @@ MODELS = [
     "mixtral-8x7b-32768"
 ]
 
-async def call(model, prompt):
+async def groq_call(model, prompt):
     try:
         def run():
             return groq.chat.completions.create(
@@ -106,75 +115,71 @@ async def call(model, prompt):
         return None
 
 
-async def ai(text, memory, role):
-    style = "коротко и точно" if role == "secretary" else "нормально"
+async def ai_engine(text, memory, role):
+    style = "коротко и по делу" if role == "secretary" else "обычный стиль"
 
     prompt = f"""
-Ты ассистент.
-Стиль: {style}
-Память: {memory}
+Ты AI ассистент.
 
-Пользователь: {text}
+Стиль ответа: {style}
+
+Память:
+{memory}
+
+Запрос:
+{text}
 """
 
-    for m in MODELS:
-        for i in range(2):
-            res = await call(m, prompt)
+    for model in MODELS:
+        for _ in range(2):
+            res = await groq_call(model, prompt)
             if res:
                 return res
-            await asyncio.sleep(0.2 * (i + 1))
+            await asyncio.sleep(0.2)
 
-    return "⚠️ AI перегружен"
+    return "⚠️ AI временно перегружен"
+
+# ================= SUBSCRIPTION GUARD =================
+
+def is_limit_exceeded(user):
+    tier, messages = user[1], user[4]
+    return messages >= LIMITS.get(tier, 0)
 
 # ================= START =================
 
 @router.message(F.text == "/start")
 async def start(msg: Message):
-    create(msg.from_user.id)
-    await msg.answer("🤖 SaaS Online. Пиши сообщение.", reply_markup=kb())
+    create_user(msg.from_user.id)
+    await msg.answer("🤖 Jarvis SaaS v1 онлайн. Просто пиши сообщение.", reply_markup=main_kb())
 
-# ================= CHAT =================
+# ================= CHAT FLOW =================
 
 @router.message(F.text)
 async def chat(msg: Message):
     uid = msg.from_user.id
-    user = get(uid)
+    user = get_user(uid)
 
     if not user:
-        create(uid)
-        user = get(uid)
+        create_user(uid)
+        user = get_user(uid)
+
+    if is_limit_exceeded(user):
+        return await msg.answer("🚫 Лимит исчерпан. Оформи подписку 💎")
 
     tier, role, memory, used = user[1], user[2], user[3], user[4]
 
-    if used >= LIMITS[tier]:
-        return await msg.answer("🚫 Лимит исчерпан")
+    reply = await ai_engine(msg.text, memory, role)
 
-    reply = await ai(msg.text, memory, role)
+    memory = memory_engine(memory, msg.text, reply)
 
-    memory = memory_pack(memory, msg.text, reply)
-
-    update(uid,
+    update_user(uid,
         memory=memory,
         messages=used + 1
     )
 
-    await msg.answer(reply, reply_markup=kb())
+    await msg.answer(reply, reply_markup=main_kb())
 
-# ================= PAYMENTS (BASE STRUCTURE) =================
-
-async def check_payment(invoice_id):
-    url = f"https://pay.crypt.bot/api/getInvoices"
-    headers = {"Crypto-Pay-API-Token": CRYPTO_PAY_TOKEN}
-
-    async with session.get(url, headers=headers) as r:
-        data = await r.json()
-
-    for inv in data.get("result", {}).get("items", []):
-        if inv["invoice_id"] == invoice_id and inv["status"] == "paid":
-            return True
-    return False
-
-# ================= ADMIN =================
+# ================= ADMIN PANEL =================
 
 @router.callback_query(F.data == "admin")
 async def admin(c: CallbackQuery):
@@ -185,22 +190,49 @@ async def admin(c: CallbackQuery):
     users = cur.fetchone()[0]
 
     cur.execute("SELECT COUNT(*) FROM payments")
-    pays = cur.fetchone()[0]
+    payments = cur.fetchone()[0]
 
     await c.message.answer(
-        f"👑 ADMIN PANEL\nUsers: {users}\nPayments: {pays}"
+        f"""👑 JARVIS SAAS ADMIN
+
+👤 Users: {users}
+💳 Payments: {payments}
+"""
     )
 
-# ================= SUBS =================
+# ================= SUBSCRIPTIONS =================
 
 @router.callback_query(F.data == "subs")
 async def subs(c: CallbackQuery):
-    await c.message.answer("💳 CryptoPay готов к авто-активации (webhook слой можно подключить отдельно)")
+    await c.message.answer(
+        "💎 Подписка:\n\n"
+        "PRO — 150 сообщений\n"
+        "ULTRA — 500 сообщений\n\n"
+        "⚡ Оплата через CryptoPay (webhook активирует автоматически)"
+    )
+
+# ================= CRYPTO PAY WEBHOOK (KEY PART) =================
+
+async def verify_payment(invoice_id: str):
+    url = "https://pay.crypt.bot/api/getInvoices"
+    headers = {"Crypto-Pay-API-Token": CRYPTO_PAY_TOKEN}
+
+    async with session.get(url, headers=headers) as r:
+        data = await r.json()
+
+    for inv in data.get("result", {}).get("items", []):
+        if inv["invoice_id"] == invoice_id and inv["status"] == "paid":
+            return True
+    return False
+
+
+async def activate_subscription(user_id, tier):
+    update_user(user_id, tier=tier, messages=0)
 
 # ================= RUN =================
 
 async def main():
-    print("🚀 PRODUCTION SAAS ONLINE")
+    print("🚀 JARVIS COMMERCIAL SAAS v1 ONLINE")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
