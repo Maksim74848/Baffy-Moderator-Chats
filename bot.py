@@ -32,7 +32,9 @@ CREATE TABLE IF NOT EXISTS users(
     expire TEXT DEFAULT '',
     messages INTEGER DEFAULT 0,
     memory TEXT DEFAULT '',
-    role TEXT DEFAULT 'assistant'
+    role TEXT DEFAULT 'assistant',
+    balance REAL DEFAULT 0,
+    ref INTEGER DEFAULT NULL
 )
 """)
 
@@ -41,13 +43,14 @@ CREATE TABLE IF NOT EXISTS invoices(
     invoice_id TEXT PRIMARY KEY,
     user_id INTEGER,
     tier TEXT,
+    amount REAL,
     used INTEGER DEFAULT 0
 )
 """)
 
 db.commit()
 
-# ================= LIMITS =================
+# ================= CONFIG =================
 
 LIMITS = {
     "free": 15,
@@ -55,30 +58,32 @@ LIMITS = {
     "ultra": 250
 }
 
+PRICES = {
+    "pro": 1,
+    "ultra": 3
+}
+
+REF_PERCENT = 0.20
+
 # ================= UI =================
 
 def menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💬 Чат", callback_data="chat")],
         [InlineKeyboardButton(text="💎 Подписка", callback_data="subs")],
-        [InlineKeyboardButton(text="🧠 Роль", callback_data="role")]
+        [InlineKeyboardButton(text="💰 Баланс", callback_data="bal")]
     ])
 
 def subs_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="PRO 30d - $1", callback_data="buy_pro")],
-        [InlineKeyboardButton(text="ULTRA 30d - $3", callback_data="buy_ultra")]
+        [InlineKeyboardButton(text="PRO", callback_data="buy_pro")],
+        [InlineKeyboardButton(text="ULTRA", callback_data="buy_ultra")]
     ])
 
 # ================= AI =================
 
 async def ask_ai(text, memory, role):
-    prompt = f"""
-Role: {role}
-Memory: {memory}
-
-User: {text}
-"""
+    prompt = f"{role}\n{memory}\nUser:{text}"
 
     def call():
         return groq.chat.completions.create(
@@ -88,20 +93,22 @@ User: {text}
 
     return await asyncio.to_thread(call)
 
-# ================= SUBS CHECK =================
+# ================= LIMITS =================
 
-def is_expired(expire_str):
-    if not expire_str:
+def is_expired(exp):
+    if not exp:
         return True
-    return datetime.utcnow() > datetime.fromisoformat(expire_str)
+    return datetime.utcnow() > datetime.fromisoformat(exp)
 
 # ================= START =================
 
 @dp.message(F.text == "/start")
 async def start(msg: Message):
-    cur.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (msg.from_user.id,))
+    cur.execute("INSERT OR IGNORE INTO users(user_id, ref) VALUES(?,?)",
+                (msg.from_user.id, None))
     db.commit()
-    await msg.answer("🤖 JARVIS SaaS 3.0 ONLINE", reply_markup=menu())
+
+    await msg.answer("🤖 SaaS 4.0 ONLINE", reply_markup=menu())
 
 # ================= CHAT =================
 
@@ -110,11 +117,11 @@ async def chat(msg: Message):
     uid = msg.from_user.id
 
     cur.execute("SELECT tier, expire, memory, role, messages FROM users WHERE user_id=?", (uid,))
-    tier, expire, memory, role, used = cur.fetchone()
+    tier, exp, memory, role, used = cur.fetchone()
 
-    if tier != "free" and is_expired(expire):
+    if tier != "free" and is_expired(exp):
         tier = "free"
-        cur.execute("UPDATE users SET tier='free', expire='' WHERE user_id=?", (uid,))
+        cur.execute("UPDATE users SET tier='free' WHERE user_id=?", (uid,))
         db.commit()
 
     if used >= LIMITS[tier]:
@@ -146,11 +153,19 @@ async def send_voice(uid, text):
     except:
         pass
 
+# ================= BALANCE =================
+
+@dp.callback_query(F.data == "bal")
+async def bal(c: CallbackQuery):
+    cur.execute("SELECT balance FROM users WHERE user_id=?", (c.from_user.id,))
+    b = cur.fetchone()[0]
+    await c.message.answer(f"💰 Баланс: {b}$")
+
 # ================= SUBS =================
 
 @dp.callback_query(F.data == "subs")
 async def subs(c: CallbackQuery):
-    await c.message.answer("💎 Выбери тариф:", reply_markup=subs_menu())
+    await c.message.answer("💎 Тарифы:", reply_markup=subs_menu())
 
 async def create_invoice(uid, tier, amount):
     async with aiohttp.ClientSession() as s:
@@ -177,20 +192,17 @@ async def create_invoice(uid, tier, amount):
 async def buy(c: CallbackQuery):
     tier = c.data.replace("buy_", "")
 
-    prices = {
-        "pro": 1,
-        "ultra": 3
-    }
-
-    url, inv_id = await create_invoice(c.from_user.id, tier, prices[tier])
+    url, inv_id = await create_invoice(c.from_user.id, tier, PRICES[tier])
 
     await c.message.answer(f"💳 Оплата:\n{url}")
 
 # ================= PAYMENT ENGINE =================
 
 async def payment_worker():
+    processed = set()
+
     while True:
-        await asyncio.sleep(8)
+        await asyncio.sleep(7)
 
         async with aiohttp.ClientSession() as s:
             async with s.get(
@@ -203,29 +215,43 @@ async def payment_worker():
             if inv["status"] != "paid":
                 continue
 
-            cur.execute("SELECT used FROM invoices WHERE invoice_id=?", (inv["invoice_id"],))
+            if inv["invoice_id"] in processed:
+                continue
+
+            cur.execute("SELECT user_id, tier FROM invoices WHERE invoice_id=?",
+                        (inv["invoice_id"],))
             row = cur.fetchone()
 
             if not row:
                 continue
 
-            # already processed
-            if row[0] == 1:
-                continue
+            uid, tier = row
 
-            cur.execute("SELECT user_id, tier FROM invoices WHERE invoice_id=?", (inv["invoice_id"],))
-            uid, tier = cur.fetchone()
+            # expire 30 days
+            exp = (datetime.utcnow() + timedelta(days=30)).isoformat()
 
-            expire = (datetime.utcnow() + timedelta(days=30)).isoformat()
-
+            # update user tier
             cur.execute("""
             UPDATE users
             SET tier=?, expire=?
             WHERE user_id=?
-            """, (tier, expire, uid))
+            """, (tier, exp, uid))
 
-            cur.execute("UPDATE invoices SET used=1 WHERE invoice_id=?", (inv["invoice_id"],))
+            # referral logic (optional placeholder)
+            cur.execute("SELECT ref FROM users WHERE user_id=?", (uid,))
+            ref = cur.fetchone()[0]
+
+            if ref:
+                bonus = PRICES[tier] * REF_PERCENT
+
+                cur.execute("""
+                UPDATE users SET balance = balance + ?
+                WHERE user_id=?
+                """, (bonus, ref))
+
             db.commit()
+
+            processed.add(inv["invoice_id"])
 
 # ================= RUN =================
 
