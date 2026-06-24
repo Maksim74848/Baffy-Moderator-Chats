@@ -2,6 +2,7 @@ import os
 import asyncio
 import sqlite3
 import aiohttp
+import hashlib
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
@@ -34,7 +35,8 @@ CREATE TABLE IF NOT EXISTS users(
     memory TEXT DEFAULT '',
     role TEXT DEFAULT 'assistant',
     balance REAL DEFAULT 0,
-    ref INTEGER DEFAULT NULL
+    ref INTEGER,
+    total_paid REAL DEFAULT 0
 )
 """)
 
@@ -48,42 +50,70 @@ CREATE TABLE IF NOT EXISTS invoices(
 )
 """)
 
+cur.execute("""
+CREATE TABLE IF NOT EXISTS cache(
+    key TEXT PRIMARY KEY,
+    response TEXT,
+    created TEXT
+)
+""")
+
 db.commit()
 
 # ================= CONFIG =================
 
-LIMITS = {
-    "free": 15,
-    "pro": 80,
-    "ultra": 250
-}
+LIMITS = {"free": 15, "pro": 80, "ultra": 250}
+PRICES = {"pro": 1, "ultra": 3}
+REF_PERCENT = 0.2
 
-PRICES = {
-    "pro": 1,
-    "ultra": 3
-}
+CACHE_TTL_MINUTES = 30
 
-REF_PERCENT = 0.20
+# ================= UTILS =================
 
-# ================= UI =================
+def now():
+    return datetime.utcnow()
 
-def menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💬 Чат", callback_data="chat")],
-        [InlineKeyboardButton(text="💎 Подписка", callback_data="subs")],
-        [InlineKeyboardButton(text="💰 Баланс", callback_data="bal")]
-    ])
+def is_expired(exp):
+    if not exp:
+        return True
+    return now() > datetime.fromisoformat(exp)
 
-def subs_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="PRO", callback_data="buy_pro")],
-        [InlineKeyboardButton(text="ULTRA", callback_data="buy_ultra")]
-    ])
+def make_key(text, role):
+    return hashlib.md5((text + role).encode()).hexdigest()
+
+# ================= CACHE =================
+
+def get_cache(key):
+    cur.execute("SELECT response, created FROM cache WHERE key=?", (key,))
+    row = cur.fetchone()
+
+    if not row:
+        return None
+
+    resp, created = row
+    created = datetime.fromisoformat(created)
+
+    if now() - created > timedelta(minutes=CACHE_TTL_MINUTES):
+        return None
+
+    return resp
+
+def set_cache(key, resp):
+    cur.execute("""
+    INSERT OR REPLACE INTO cache VALUES (?,?,?)
+    """, (key, resp, now().isoformat()))
+    db.commit()
 
 # ================= AI =================
 
 async def ask_ai(text, memory, role):
-    prompt = f"{role}\n{memory}\nUser:{text}"
+    key = make_key(text, role)
+
+    cached = get_cache(key)
+    if cached:
+        return cached
+
+    prompt = f"ROLE:{role}\nMEM:{memory}\nUSER:{text}"
 
     def call():
         return groq.chat.completions.create(
@@ -91,29 +121,40 @@ async def ask_ai(text, memory, role):
             messages=[{"role": "user", "content": prompt}]
         ).choices[0].message.content
 
-    return await asyncio.to_thread(call)
+    resp = await asyncio.to_thread(call)
+    set_cache(key, resp)
+
+    return resp
 
 # ================= LIMITS =================
 
-def is_expired(exp):
-    if not exp:
-        return True
-    return datetime.utcnow() > datetime.fromisoformat(exp)
+def check_limit(uid):
+    cur.execute("SELECT tier, messages FROM users WHERE user_id=?", (uid,))
+    tier, used = cur.fetchone()
+    return used < LIMITS[tier]
+
+def inc_msg(uid):
+    cur.execute("UPDATE users SET messages = messages + 1 WHERE user_id=?", (uid,))
+    db.commit()
 
 # ================= START =================
 
 @dp.message(F.text == "/start")
 async def start(msg: Message):
+    ref = None
+    if " " in msg.text:
+        ref = msg.text.split()[1]
+
     cur.execute("INSERT OR IGNORE INTO users(user_id, ref) VALUES(?,?)",
-                (msg.from_user.id, None))
+                (msg.from_user.id, ref))
     db.commit()
 
-    await msg.answer("🤖 SaaS 4.0 ONLINE", reply_markup=menu())
+    await msg.answer("🚀 SaaS 5.0 ONLINE")
 
-# ================= CHAT =================
+# ================= CORE ENGINE =================
 
 @dp.message(F.text)
-async def chat(msg: Message):
+async def engine(msg: Message):
     uid = msg.from_user.id
 
     cur.execute("SELECT tier, expire, memory, role, messages FROM users WHERE user_id=?", (uid,))
@@ -124,23 +165,22 @@ async def chat(msg: Message):
         cur.execute("UPDATE users SET tier='free' WHERE user_id=?", (uid,))
         db.commit()
 
-    if used >= LIMITS[tier]:
-        await msg.answer("🚫 Лимит исчерпан")
+    if not check_limit(uid):
+        await msg.answer("🚫 лимит исчерпан")
         return
 
-    cur.execute("UPDATE users SET messages = messages + 1 WHERE user_id=?", (uid,))
-    db.commit()
+    inc_msg(uid)
 
-    reply = await ask_ai(msg.text, memory, role)
+    resp = await ask_ai(msg.text, memory, role)
 
-    memory = (memory + f"\nU:{msg.text}\nA:{reply}")[-2500:]
+    memory = (memory + f"\nU:{msg.text}\nA:{resp}")[-3000:]
 
     cur.execute("UPDATE users SET memory=? WHERE user_id=?", (memory, uid))
     db.commit()
 
-    await msg.answer(reply)
+    await msg.answer(resp)
 
-    asyncio.create_task(send_voice(uid, reply))
+    asyncio.create_task(send_voice(uid, resp))
 
 # ================= VOICE =================
 
@@ -153,56 +193,13 @@ async def send_voice(uid, text):
     except:
         pass
 
-# ================= BALANCE =================
-
-@dp.callback_query(F.data == "bal")
-async def bal(c: CallbackQuery):
-    cur.execute("SELECT balance FROM users WHERE user_id=?", (c.from_user.id,))
-    b = cur.fetchone()[0]
-    await c.message.answer(f"💰 Баланс: {b}$")
-
-# ================= SUBS =================
-
-@dp.callback_query(F.data == "subs")
-async def subs(c: CallbackQuery):
-    await c.message.answer("💎 Тарифы:", reply_markup=subs_menu())
-
-async def create_invoice(uid, tier, amount):
-    async with aiohttp.ClientSession() as s:
-        async with s.post(
-            "https://pay.crypt.bot/api/createInvoice",
-            headers={"Crypto-Pay-API-Token": CRYPTO_PAY_TOKEN},
-            json={
-                "asset": "USDT",
-                "amount": amount,
-                "description": f"Jarvis {tier}"
-            }
-        ) as r:
-            data = await r.json()
-            inv = data["result"]
-
-            cur.execute("""
-            INSERT OR IGNORE INTO invoices VALUES (?,?,?,0)
-            """, (inv["invoice_id"], uid, tier))
-            db.commit()
-
-            return inv["pay_url"], inv["invoice_id"]
-
-@dp.callback_query(F.data.startswith("buy_"))
-async def buy(c: CallbackQuery):
-    tier = c.data.replace("buy_", "")
-
-    url, inv_id = await create_invoice(c.from_user.id, tier, PRICES[tier])
-
-    await c.message.answer(f"💳 Оплата:\n{url}")
-
 # ================= PAYMENT ENGINE =================
 
 async def payment_worker():
     processed = set()
 
     while True:
-        await asyncio.sleep(7)
+        await asyncio.sleep(6)
 
         async with aiohttp.ClientSession() as s:
             async with s.get(
@@ -227,28 +224,32 @@ async def payment_worker():
 
             uid, tier = row
 
-            # expire 30 days
-            exp = (datetime.utcnow() + timedelta(days=30)).isoformat()
+            expire = (datetime.utcnow() + timedelta(days=30)).isoformat()
 
-            # update user tier
             cur.execute("""
             UPDATE users
-            SET tier=?, expire=?
+            SET tier=?, expire=?, total_paid = total_paid + ?
             WHERE user_id=?
-            """, (tier, exp, uid))
+            """, (tier, expire, PRICES[tier], uid))
 
-            # referral logic (optional placeholder)
+            # anti-fraud + referral
             cur.execute("SELECT ref FROM users WHERE user_id=?", (uid,))
             ref = cur.fetchone()[0]
 
-            if ref:
-                bonus = PRICES[tier] * REF_PERCENT
+            if ref and ref != uid:
+                cur.execute("SELECT total_paid FROM users WHERE user_id=?", (uid,))
+                total = cur.fetchone()[0]
 
-                cur.execute("""
-                UPDATE users SET balance = balance + ?
-                WHERE user_id=?
-                """, (bonus, ref))
+                # anti-fraud rule
+                if total >= 1:
+                    bonus = PRICES[tier] * REF_PERCENT
 
+                    cur.execute("""
+                    UPDATE users SET balance = balance + ?
+                    WHERE user_id=?
+                    """, (bonus, ref))
+
+            cur.execute("UPDATE invoices SET used=1 WHERE invoice_id=?", (inv["invoice_id"],))
             db.commit()
 
             processed.add(inv["invoice_id"])
