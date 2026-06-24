@@ -1,212 +1,150 @@
 import os
 import asyncio
 import sqlite3
-import aiohttp
-import hashlib
-import traceback
 from datetime import datetime, timedelta
 
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.storage.memory import MemoryStorage
 
 from groq import Groq
-from gtts import gTTS
 
-# ================= CONFIG =================
+# ================== CONFIG ==================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-CRYPTO_PAY_TOKEN = os.getenv("CRYPTO_PAY_TOKEN")
 
 bot = Bot(BOT_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
 
 groq = Groq(api_key=GROQ_API_KEY)
 
-# ================= DB =================
+# ================== DB ==================
 
-db = sqlite3.connect("jarvis.db", check_same_thread=False)
+db = sqlite3.connect("jarvis.db")
+db.row_factory = sqlite3.Row
 cur = db.cursor()
 
 cur.execute("""
-CREATE TABLE IF NOT EXISTS users(
+CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
     tier TEXT DEFAULT 'free',
-    expire TEXT DEFAULT '',
-    messages INTEGER DEFAULT 0,
     memory TEXT DEFAULT '',
     role TEXT DEFAULT 'assistant',
-    balance REAL DEFAULT 0,
-    ref INTEGER,
-    total_paid REAL DEFAULT 0
+    messages INTEGER DEFAULT 0
 )
 """)
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS invoices(
-    invoice_id TEXT PRIMARY KEY,
-    user_id INTEGER,
-    tier TEXT,
-    amount REAL,
-    used INTEGER DEFAULT 0
-)
-""")
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS cache(
-    key TEXT PRIMARY KEY,
-    response TEXT,
-    created TEXT
-)
-""")
-
 db.commit()
 
-# ================= CONFIG =================
+# ================== FSM ==================
 
-LIMITS = {"free": 15, "pro": 80, "ultra": 250}
-PRICES = {"pro": 1, "ultra": 3}
-REF_PERCENT = 0.2
-CACHE_TTL = 30
+class UI(StatesGroup):
+    menu = State()
+    chat = State()
 
-# ================= UTILS =================
+# ================== UI ==================
 
-def now():
-    return datetime.utcnow()
+def menu_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Чат", callback_data="chat")],
+        [InlineKeyboardButton(text="⚙️ Роль", callback_data="role")],
+    ])
 
-def is_expired(exp):
-    if not exp:
-        return True
-    return now() > datetime.fromisoformat(exp)
+def back_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")]
+    ])
 
-def make_key(text, role):
-    return hashlib.md5((text + role).encode()).hexdigest()
+# ================== AI ==================
 
-# ================= CACHE =================
+def ask_ai_sync(text, memory, role):
+    prompt = f"""
+Ты — {role}.
+Контекст:
+{memory}
 
-def get_cache(key):
-    cur.execute("SELECT response, created FROM cache WHERE key=?", (key,))
-    row = cur.fetchone()
-    if not row:
-        return None
+Сообщение пользователя:
+{text}
+"""
+    result = groq.chat.completions.create(
+        model="llama3-70b-8192",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return result.choices[0].message.content
 
-    resp, created = row
-    created = datetime.fromisoformat(created)
-
-    if now() - created > timedelta(minutes=CACHE_TTL):
-        return None
-
-    return resp
-
-def set_cache(key, resp):
-    cur.execute("INSERT OR REPLACE INTO cache VALUES (?,?,?)",
-                (key, resp, now().isoformat()))
-    db.commit()
-
-# ================= AI =================
-
-async def ask_ai(text, memory, role):
-    key = make_key(text, role)
-
-    cached = get_cache(key)
-    if cached:
-        return cached
-
-    prompt = f"ROLE:{role}\nMEM:{memory}\nUSER:{text}"
-
-    try:
-        def call():
-            return groq.chat.completions.create(
-                model="llama3-70b-8192",
-                messages=[{"role": "user", "content": prompt}]
-            ).choices[0].message.content
-
-        resp = await asyncio.to_thread(call)
-
-    except Exception as e:
-        resp = "⚠️ AI ошибка. Попробуй позже."
-
-    set_cache(key, resp)
-    return resp
-
-# ================= LIMIT =================
-
-def check_limit(uid):
-    cur.execute("SELECT tier, messages FROM users WHERE user_id=?", (uid,))
-    tier, used = cur.fetchone()
-    return used < LIMITS[tier]
-
-def inc(uid):
-    cur.execute("UPDATE users SET messages = messages + 1 WHERE user_id=?", (uid,))
-    db.commit()
-
-# ================= START =================
+# ================== START ==================
 
 @router.message(F.text == "/start")
-async def start(msg: Message):
+async def start(msg: Message, state: FSMContext):
     cur.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (msg.from_user.id,))
     db.commit()
+    await state.set_state(UI.menu)
+    await msg.answer("🚀 Jarvis SaaS 5.1.1", reply_markup=menu_kb())
 
-    await msg.answer("🚀 SaaS 5.0 ONLINE")
+# ================== MENU ==================
 
-# ================= MAIN ENGINE (FIXED) =================
+@router.callback_query(F.data == "back")
+async def back(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    await state.set_state(UI.menu)
+    await c.message.edit_text("🏠 Главное меню", reply_markup=menu_kb())
 
-@router.message(F.text)
-async def engine(msg: Message):
+@router.callback_query(F.data == "chat")
+async def open_chat(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    await state.set_state(UI.chat)
+    await c.message.edit_text("💬 Напиши сообщение", reply_markup=back_kb())
+
+@router.callback_query(F.data == "role")
+async def role(c: CallbackQuery):
+    await c.answer()
+    cur.execute("SELECT role FROM users WHERE user_id=?", (c.from_user.id,))
+    role = cur.fetchone()["role"]
+    new_role = "секретарь" if role == "assistant" else "assistant"
+    cur.execute("UPDATE users SET role=? WHERE user_id=?", (new_role, c.from_user.id))
+    db.commit()
+    await c.message.answer(f"⚙️ Роль изменена: {new_role}")
+
+# ================== CHAT ==================
+
+@router.message(UI.chat)
+async def chat(msg: Message):
     uid = msg.from_user.id
 
     try:
-        cur.execute("SELECT tier, expire, memory, role, messages FROM users WHERE user_id=?", (uid,))
-        tier, exp, memory, role, used = cur.fetchone()
+        cur.execute("SELECT * FROM users WHERE user_id=?", (uid,))
+        user = cur.fetchone()
 
-        if tier != "free" and is_expired(exp):
-            tier = "free"
-            cur.execute("UPDATE users SET tier='free' WHERE user_id=?", (uid,))
-            db.commit()
+        reply = await asyncio.get_event_loop().run_in_executor(
+            None,
+            ask_ai_sync,
+            msg.text,
+            user["memory"],
+            user["role"]
+        )
 
-        if used >= LIMITS[tier]:
-            await msg.answer("🚫 Лимит исчерпан")
-            return
+        memory = (user["memory"] + f"\nU:{msg.text}\nA:{reply}")[-3000:]
 
-        inc(uid)
-
-        reply = await ask_ai(msg.text, memory, role)
-
-        memory = (memory + f"\nU:{msg.text}\nA:{reply}")[-3000:]
-
-        cur.execute("UPDATE users SET memory=? WHERE user_id=?", (memory, uid))
+        cur.execute(
+            "UPDATE users SET memory=?, messages=messages+1 WHERE user_id=?",
+            (memory, uid)
+        )
         db.commit()
 
         await msg.answer(reply)
 
-        asyncio.create_task(send_voice(uid, reply))
-
     except Exception as e:
-        await msg.answer("⚠️ Ошибка обработки запроса")
-        print(traceback.format_exc())
+        print("AI ERROR:", e)
+        await msg.answer("⚠️ Внутренняя ошибка. Попробуй ещё раз.")
 
-# ================= VOICE =================
-
-async def send_voice(uid, text):
-    try:
-        tts = gTTS(text[:200])
-        path = f"{uid}.mp3"
-        tts.save(path)
-        await bot.send_voice(uid, open(path, "rb"))
-    except:
-        pass
-
-# ================= RUN =================
+# ================== RUN ==================
 
 async def main():
-    asyncio.create_task(payment_worker())
     await dp.start_polling(bot)
-
-async def payment_worker():
-    while True:
-        await asyncio.sleep(10)
 
 if __name__ == "__main__":
     asyncio.run(main())
