@@ -2,7 +2,6 @@ import os
 import asyncio
 import sqlite3
 import aiohttp
-from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -51,27 +50,43 @@ CREATE TABLE IF NOT EXISTS payments(
 
 db.commit()
 
-# ================= TIERS =================
+# ================= LIMITS =================
 
 LIMITS = {"free": 25, "pro": 150, "ultra": 400}
 
 # ================= UI =================
 
-def kb():
+def keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💎 Подписка", callback_data="subs")],
         [InlineKeyboardButton(text="⚙️ Режим", callback_data="role")],
         [InlineKeyboardButton(text="👑 Админ", callback_data="admin")]
     ])
 
-# ================= MEMORY (SMART) =================
+# ================= DB HELPERS =================
 
-def compress_memory(memory: str) -> str:
-    if len(memory) < 2000:
+def get_user(uid):
+    cur.execute("SELECT * FROM users WHERE user_id=?", (uid,))
+    return cur.fetchone()
+
+def create_user(uid):
+    cur.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (uid,))
+    db.commit()
+
+def update_user(uid, **fields):
+    keys = ",".join([f"{k}=?" for k in fields])
+    vals = list(fields.values()) + [uid]
+    cur.execute(f"UPDATE users SET {keys} WHERE user_id=?", vals)
+    db.commit()
+
+# ================= MEMORY (SIMPLE BUT CORRECT) =================
+
+def compress(memory: str) -> str:
+    if len(memory) < 3000:
         return memory
-    return memory[-2000:]  # MVP compression
+    return memory[-3000:]
 
-# ================= AI CORE =================
+# ================= AI CORE (ROBUST) =================
 
 MODELS = [
     "llama-3.1-70b-versatile",
@@ -79,101 +94,90 @@ MODELS = [
     "mixtral-8x7b-32768"
 ]
 
-async def ai_call(model, prompt):
+async def groq_call(model, prompt):
     try:
         def run():
             return groq.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
-                timeout=12
+                timeout=15
             ).choices[0].message.content
 
         return await asyncio.to_thread(run)
 
-    except:
+    except Exception:
         return None
 
 
-async def ask_ai(text, memory, role):
+async def ai_answer(text, memory, role):
     style = "коротко и по делу" if role == "secretary" else "обычный стиль"
 
     prompt = f"""
-Ты AI ассистент.
-Стиль ответа: {style}
-Память: {memory}
-Пользователь: {text}
+Ты ассистент.
+Стиль: {style}
+
+Память:
+{memory}
+
+Пользователь:
+{text}
 """
 
-    for m in MODELS:
+    for model in MODELS:
         for _ in range(2):
-            res = await ai_call(m, prompt)
+            res = await groq_call(model, prompt)
             if res:
                 return res
+            await asyncio.sleep(0.2)
 
-    return "⚠️ AI временно перегружен"
-
-# ================= DB =================
-
-def get(uid):
-    cur.execute("SELECT * FROM users WHERE user_id=?", (uid,))
-    return cur.fetchone()
-
-def create(uid):
-    cur.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (uid,))
-    db.commit()
-
-def update(uid, **kw):
-    keys = ",".join([f"{k}=?" for k in kw])
-    vals = list(kw.values()) + [uid]
-    cur.execute(f"UPDATE users SET {keys} WHERE user_id=?", vals)
-    db.commit()
+    return "⚠️ Сейчас высокая нагрузка на AI. Попробуй чуть позже."
 
 # ================= START =================
 
 @router.message(F.text == "/start")
 async def start(msg: Message):
-    create(msg.from_user.id)
-    await msg.answer("🤖 Jarvis SaaS ONLINE. Просто пиши 👇", reply_markup=kb())
+    create_user(msg.from_user.id)
+    await msg.answer("🤖 Готов. Просто пиши сообщение.", reply_markup=keyboard())
 
-# ================= CHAT (NO MODES) =================
+# ================= CHAT (MAIN FLOW) =================
 
 @router.message(F.text)
 async def chat(msg: Message):
     uid = msg.from_user.id
-    user = get(uid)
+    user = get_user(uid)
 
     if not user:
-        create(uid)
-        user = get(uid)
+        create_user(uid)
+        user = get_user(uid)
 
     tier, role, memory, used = user[1], user[2], user[3], user[4]
 
     if used >= LIMITS[tier]:
-        return await msg.answer("🚫 Лимит. Подпишись.")
+        return await msg.answer("🚫 Лимит исчерпан. Оформи подписку.")
 
-    reply = await ask_ai(msg.text, memory, role)
+    reply = await ai_answer(msg.text, memory, role)
 
-    memory = compress_memory(memory + f"\nU:{msg.text}\nA:{reply}")
+    memory = compress(memory + f"\nU:{msg.text}\nA:{reply}")
 
-    update(uid,
+    update_user(uid,
         memory=memory,
         messages=used + 1
     )
 
-    await msg.answer(reply, reply_markup=kb())
+    await msg.answer(reply, reply_markup=keyboard())
 
 # ================= CALLBACKS =================
 
 @router.callback_query(F.data == "role")
 async def role(c: CallbackQuery):
-    u = get(c.from_user.id)
-    new_role = "secretary" if u[2] == "assistant" else "assistant"
-    update(c.from_user.id, role=new_role)
-    await c.message.answer(f"⚙️ Режим: {new_role}")
+    u = get_user(c.from_user.id)
+    new = "secretary" if u[2] == "assistant" else "assistant"
+    update_user(c.from_user.id, role=new)
+    await c.message.answer(f"⚙️ Режим: {new}")
 
 @router.callback_query(F.data == "subs")
 async def subs(c: CallbackQuery):
-    await c.message.answer("💎 Подписка через CryptoPay (auto webhook будет в следующем апгрейде)")
+    await c.message.answer("💎 Подписка подключается через CryptoPay (webhook можно добавить отдельно)")
 
 @router.callback_query(F.data == "admin")
 async def admin(c: CallbackQuery):
@@ -183,16 +187,12 @@ async def admin(c: CallbackQuery):
     cur.execute("SELECT COUNT(*) FROM users")
     users = cur.fetchone()[0]
 
-    await c.message.answer(f"""
-👑 ADMIN PANEL
-
-Users: {users}
-""")
+    await c.message.answer(f"👑 ADMIN\nUsers: {users}")
 
 # ================= RUN =================
 
 async def main():
-    print("🚀 SAAS 5.0 FINAL RUNNING")
+    print("🚀 SAAS FINAL RUNNING")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
