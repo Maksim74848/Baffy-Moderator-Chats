@@ -1,6 +1,5 @@
 aiogram==3.4.1
 groq
-aiohttp==3.9.5
-pillow
+aiohttp
 gtts
 python-dotenv
