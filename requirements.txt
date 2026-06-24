@@ -1,7 +1,6 @@
 aiogram==3.4.1
-aiohttp
-python-dotenv
 groq
+aiohttp
 pillow
-pytesseract
-openai
+gtts
+python-dotenv
