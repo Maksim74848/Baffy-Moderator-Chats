@@ -2,6 +2,7 @@ import os
 import asyncio
 import sqlite3
 import aiohttp
+import time
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -59,7 +60,7 @@ LIMITS = {"free": 30, "pro": 150, "ultra": 500}
 def kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💎 Подписка", callback_data="subs")],
-        [InlineKeyboardButton(text="⚙️ Админ", callback_data="admin")]
+        [InlineKeyboardButton(text="👑 Админ", callback_data="admin")]
     ])
 
 # ================= DB =================
@@ -80,11 +81,10 @@ def update(uid, **kw):
 
 # ================= MEMORY =================
 
-def memory_update(mem, user, ai):
-    text = mem + f"\nU:{user}\nA:{ai}"
-    return text[-4000:]  # safe truncate
+def memory_pack(mem, u, a):
+    return (mem + f"\nU:{u}\nA:{a}")[-3500:]
 
-# ================= AI ENGINE =================
+# ================= AI CORE =================
 
 MODELS = [
     "llama-3.1-70b-versatile",
@@ -92,7 +92,7 @@ MODELS = [
     "mixtral-8x7b-32768"
 ]
 
-async def call_ai(model, prompt):
+async def call(model, prompt):
     try:
         def run():
             return groq.chat.completions.create(
@@ -107,7 +107,7 @@ async def call_ai(model, prompt):
 
 
 async def ai(text, memory, role):
-    style = "коротко" if role == "secretary" else "нормально"
+    style = "коротко и точно" if role == "secretary" else "нормально"
 
     prompt = f"""
 Ты ассистент.
@@ -118,11 +118,11 @@ async def ai(text, memory, role):
 """
 
     for m in MODELS:
-        for _ in range(2):
-            res = await call_ai(m, prompt)
+        for i in range(2):
+            res = await call(m, prompt)
             if res:
                 return res
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.2 * (i + 1))
 
     return "⚠️ AI перегружен"
 
@@ -131,7 +131,7 @@ async def ai(text, memory, role):
 @router.message(F.text == "/start")
 async def start(msg: Message):
     create(msg.from_user.id)
-    await msg.answer("🤖 Готов. Просто пиши.", reply_markup=kb())
+    await msg.answer("🤖 SaaS Online. Пиши сообщение.", reply_markup=kb())
 
 # ================= CHAT =================
 
@@ -147,11 +147,11 @@ async def chat(msg: Message):
     tier, role, memory, used = user[1], user[2], user[3], user[4]
 
     if used >= LIMITS[tier]:
-        return await msg.answer("🚫 Лимит. Оформи подписку.")
+        return await msg.answer("🚫 Лимит исчерпан")
 
     reply = await ai(msg.text, memory, role)
 
-    memory = memory_update(memory, msg.text, reply)
+    memory = memory_pack(memory, msg.text, reply)
 
     update(uid,
         memory=memory,
@@ -159,6 +159,20 @@ async def chat(msg: Message):
     )
 
     await msg.answer(reply, reply_markup=kb())
+
+# ================= PAYMENTS (BASE STRUCTURE) =================
+
+async def check_payment(invoice_id):
+    url = f"https://pay.crypt.bot/api/getInvoices"
+    headers = {"Crypto-Pay-API-Token": CRYPTO_PAY_TOKEN}
+
+    async with session.get(url, headers=headers) as r:
+        data = await r.json()
+
+    for inv in data.get("result", {}).get("items", []):
+        if inv["invoice_id"] == invoice_id and inv["status"] == "paid":
+            return True
+    return False
 
 # ================= ADMIN =================
 
@@ -171,22 +185,22 @@ async def admin(c: CallbackQuery):
     users = cur.fetchone()[0]
 
     cur.execute("SELECT COUNT(*) FROM payments")
-    payments = cur.fetchone()[0]
+    pays = cur.fetchone()[0]
 
     await c.message.answer(
-        f"👑 ADMIN PANEL\n\nUsers: {users}\nPayments: {payments}"
+        f"👑 ADMIN PANEL\nUsers: {users}\nPayments: {pays}"
     )
 
 # ================= SUBS =================
 
 @router.callback_query(F.data == "subs")
 async def subs(c: CallbackQuery):
-    await c.message.answer("💳 CryptoPay подключается через webhook (готово к расширению)")
+    await c.message.answer("💳 CryptoPay готов к авто-активации (webhook слой можно подключить отдельно)")
 
 # ================= RUN =================
 
 async def main():
-    print("🚀 FINAL SAAS SYSTEM ONLINE")
+    print("🚀 PRODUCTION SAAS ONLINE")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
