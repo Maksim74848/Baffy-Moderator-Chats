@@ -21,8 +21,8 @@ dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
 
-session = aiohttp.ClientSession()
 groq = Groq(api_key=GROQ_API_KEY)
+session = aiohttp.ClientSession()
 
 # ================= DB =================
 
@@ -52,41 +52,39 @@ db.commit()
 
 # ================= LIMITS =================
 
-LIMITS = {"free": 25, "pro": 150, "ultra": 400}
+LIMITS = {"free": 30, "pro": 150, "ultra": 500}
 
 # ================= UI =================
 
-def keyboard():
+def kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💎 Подписка", callback_data="subs")],
-        [InlineKeyboardButton(text="⚙️ Режим", callback_data="role")],
-        [InlineKeyboardButton(text="👑 Админ", callback_data="admin")]
+        [InlineKeyboardButton(text="⚙️ Админ", callback_data="admin")]
     ])
 
-# ================= DB HELPERS =================
+# ================= DB =================
 
-def get_user(uid):
+def get(uid):
     cur.execute("SELECT * FROM users WHERE user_id=?", (uid,))
     return cur.fetchone()
 
-def create_user(uid):
+def create(uid):
     cur.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (uid,))
     db.commit()
 
-def update_user(uid, **fields):
-    keys = ",".join([f"{k}=?" for k in fields])
-    vals = list(fields.values()) + [uid]
+def update(uid, **kw):
+    keys = ",".join([f"{k}=?" for k in kw])
+    vals = list(kw.values()) + [uid]
     cur.execute(f"UPDATE users SET {keys} WHERE user_id=?", vals)
     db.commit()
 
-# ================= MEMORY (SIMPLE BUT CORRECT) =================
+# ================= MEMORY =================
 
-def compress(memory: str) -> str:
-    if len(memory) < 3000:
-        return memory
-    return memory[-3000:]
+def memory_update(mem, user, ai):
+    text = mem + f"\nU:{user}\nA:{ai}"
+    return text[-4000:]  # safe truncate
 
-# ================= AI CORE (ROBUST) =================
+# ================= AI ENGINE =================
 
 MODELS = [
     "llama-3.1-70b-versatile",
@@ -94,90 +92,75 @@ MODELS = [
     "mixtral-8x7b-32768"
 ]
 
-async def groq_call(model, prompt):
+async def call_ai(model, prompt):
     try:
         def run():
             return groq.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
-                timeout=15
+                timeout=12
             ).choices[0].message.content
 
         return await asyncio.to_thread(run)
-
-    except Exception:
+    except:
         return None
 
 
-async def ai_answer(text, memory, role):
-    style = "коротко и по делу" if role == "secretary" else "обычный стиль"
+async def ai(text, memory, role):
+    style = "коротко" if role == "secretary" else "нормально"
 
     prompt = f"""
 Ты ассистент.
 Стиль: {style}
+Память: {memory}
 
-Память:
-{memory}
-
-Пользователь:
-{text}
+Пользователь: {text}
 """
 
-    for model in MODELS:
+    for m in MODELS:
         for _ in range(2):
-            res = await groq_call(model, prompt)
+            res = await call_ai(m, prompt)
             if res:
                 return res
             await asyncio.sleep(0.2)
 
-    return "⚠️ Сейчас высокая нагрузка на AI. Попробуй чуть позже."
+    return "⚠️ AI перегружен"
 
 # ================= START =================
 
 @router.message(F.text == "/start")
 async def start(msg: Message):
-    create_user(msg.from_user.id)
-    await msg.answer("🤖 Готов. Просто пиши сообщение.", reply_markup=keyboard())
+    create(msg.from_user.id)
+    await msg.answer("🤖 Готов. Просто пиши.", reply_markup=kb())
 
-# ================= CHAT (MAIN FLOW) =================
+# ================= CHAT =================
 
 @router.message(F.text)
 async def chat(msg: Message):
     uid = msg.from_user.id
-    user = get_user(uid)
+    user = get(uid)
 
     if not user:
-        create_user(uid)
-        user = get_user(uid)
+        create(uid)
+        user = get(uid)
 
     tier, role, memory, used = user[1], user[2], user[3], user[4]
 
     if used >= LIMITS[tier]:
-        return await msg.answer("🚫 Лимит исчерпан. Оформи подписку.")
+        return await msg.answer("🚫 Лимит. Оформи подписку.")
 
-    reply = await ai_answer(msg.text, memory, role)
+    reply = await ai(msg.text, memory, role)
 
-    memory = compress(memory + f"\nU:{msg.text}\nA:{reply}")
+    memory = memory_update(memory, msg.text, reply)
 
-    update_user(uid,
+    update(uid,
         memory=memory,
         messages=used + 1
     )
 
-    await msg.answer(reply, reply_markup=keyboard())
+    await msg.answer(reply, reply_markup=kb())
 
-# ================= CALLBACKS =================
-
-@router.callback_query(F.data == "role")
-async def role(c: CallbackQuery):
-    u = get_user(c.from_user.id)
-    new = "secretary" if u[2] == "assistant" else "assistant"
-    update_user(c.from_user.id, role=new)
-    await c.message.answer(f"⚙️ Режим: {new}")
-
-@router.callback_query(F.data == "subs")
-async def subs(c: CallbackQuery):
-    await c.message.answer("💎 Подписка подключается через CryptoPay (webhook можно добавить отдельно)")
+# ================= ADMIN =================
 
 @router.callback_query(F.data == "admin")
 async def admin(c: CallbackQuery):
@@ -187,12 +170,23 @@ async def admin(c: CallbackQuery):
     cur.execute("SELECT COUNT(*) FROM users")
     users = cur.fetchone()[0]
 
-    await c.message.answer(f"👑 ADMIN\nUsers: {users}")
+    cur.execute("SELECT COUNT(*) FROM payments")
+    payments = cur.fetchone()[0]
+
+    await c.message.answer(
+        f"👑 ADMIN PANEL\n\nUsers: {users}\nPayments: {payments}"
+    )
+
+# ================= SUBS =================
+
+@router.callback_query(F.data == "subs")
+async def subs(c: CallbackQuery):
+    await c.message.answer("💳 CryptoPay подключается через webhook (готово к расширению)")
 
 # ================= RUN =================
 
 async def main():
-    print("🚀 SAAS FINAL RUNNING")
+    print("🚀 FINAL SAAS SYSTEM ONLINE")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
