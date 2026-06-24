@@ -22,7 +22,6 @@ dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
 
-# HTTP SESSION (FAST FIX)
 session = aiohttp.ClientSession()
 
 groq = Groq(api_key=GROQ_API_KEY)
@@ -42,49 +41,66 @@ CREATE TABLE IF NOT EXISTS users(
     messages INTEGER DEFAULT 0
 )
 """)
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS invoices(
+    invoice_id TEXT PRIMARY KEY,
+    user_id INTEGER,
+    tier TEXT,
+    status TEXT DEFAULT 'pending'
+)
+""")
+
 db.commit()
 
 # ================= LIMITS =================
 
 LIMITS = {"free": 20, "pro": 120, "ultra": 300}
 
-# ================= UI (MINIMAL) =================
+# ================= UI =================
 
-def buttons():
+def kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💎 Подписка", callback_data="subs")],
-        [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
+        [InlineKeyboardButton(text="⚙️ Роль", callback_data="role")],
         [InlineKeyboardButton(text="👑 Админ", callback_data="admin")]
     ])
 
-# ================= AI (FAST + STABLE) =================
+# ================= SAFE AI CORE =================
+
+async def call_groq(model, prompt):
+    try:
+        def run():
+            return groq.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                timeout=12
+            ).choices[0].message.content
+
+        return await asyncio.to_thread(run)
+    except Exception as e:
+        print(f"[AI FAIL] {model}:", e)
+        return None
+
 
 async def ask_ai(text, memory, role):
-    prompt = f"Ты ИИ помощник. Роль: {role}. Память: {memory}. Пользователь: {text}"
+    prompt = f"Ты ассистент. Роль:{role}. Память:{memory}. Пользователь:{text}"
 
     models = [
         "llama-3.1-70b-versatile",
+        "llama-3.1-8b-instant",
         "mixtral-8x7b-32768"
     ]
 
-    for model in models:
-        try:
-            def call():
-                return groq.chat.completions.create(
-                    model=model,
-                    messages=[{"role": "user", "content": prompt}],
-                    timeout=12
-                ).choices[0].message.content
+    for m in models:
+        for _ in range(2):  # retry
+            res = await call_groq(m, prompt)
+            if res:
+                return res
 
-            return await asyncio.to_thread(call)
+    return "⚠️ AI временно перегружен. Попробуй ещё раз через минуту."
 
-        except Exception as e:
-            print("MODEL FAIL:", model, e)
-            continue
-
-    return "⚠️ AI временно недоступен. Попробуй снова."
-
-# ================= DB HELPERS =================
+# ================= DB =================
 
 def get(uid):
     cur.execute("SELECT * FROM users WHERE user_id=?", (uid,))
@@ -106,7 +122,7 @@ def update(uid, **kw):
 @router.message(F.text == "/start")
 async def start(msg: Message):
     create(msg.from_user.id)
-    await msg.answer("🤖 Привет! Просто напиши сообщение 👇", reply_markup=buttons())
+    await msg.answer("🤖 Привет! Просто напиши сообщение.", reply_markup=kb())
 
 # ================= CHAT (NO MODES) =================
 
@@ -122,31 +138,31 @@ async def chat(msg: Message):
     tier, _, role, memory, used = user[1], user[2], user[3], user[4], user[5]
 
     if used >= LIMITS[tier]:
-        return await msg.answer("🚫 Лимит исчерпан. Оформи подписку.")
+        return await msg.answer("🚫 Лимит исчерпан")
 
     reply = await ask_ai(msg.text, memory, role)
 
-    memory = (memory + f"\nU:{msg.text}\nA:{reply}")[-4000:]
+    memory = (memory + f"\nU:{msg.text}\nA:{reply}")[-5000:]
 
     update(uid,
         memory=memory,
         messages=used + 1
     )
 
-    await msg.answer(reply, reply_markup=buttons())
+    await msg.answer(reply, reply_markup=kb())
 
 # ================= CALLBACKS =================
 
-@router.callback_query(F.data == "subs")
-async def subs(c: CallbackQuery):
-    await c.message.answer("💎 Подписка:\nPRO / ULTRA\n(подключается через CryptoPay)")
-
-@router.callback_query(F.data == "settings")
-async def settings(c: CallbackQuery):
+@router.callback_query(F.data == "role")
+async def role(c: CallbackQuery):
     u = get(c.from_user.id)
     new_role = "secretary" if u[3] == "assistant" else "assistant"
     update(c.from_user.id, role=new_role)
     await c.message.answer(f"⚙️ Роль: {new_role}")
+
+@router.callback_query(F.data == "subs")
+async def subs(c: CallbackQuery):
+    await c.message.answer("💎 Подписка:\nPRO / ULTRA через CryptoPay")
 
 @router.callback_query(F.data == "admin")
 async def admin(c: CallbackQuery):
@@ -161,7 +177,7 @@ async def admin(c: CallbackQuery):
 # ================= RUN =================
 
 async def main():
-    print("🚀 SAAS 2.0 ONLINE")
+    print("🚀 SAAS 3.0 ONLINE")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
