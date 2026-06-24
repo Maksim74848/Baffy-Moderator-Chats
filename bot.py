@@ -1,210 +1,185 @@
 import os
 import asyncio
-import aiohttp
-import base64
 import sqlite3
+import aiohttp
+from datetime import datetime, timedelta
+
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import (
-    Message, CallbackQuery,
-    InlineKeyboardButton, InlineKeyboardMarkup,
-    Voice
-)
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
+
 from groq import Groq
-from PIL import Image
-import pytesseract
-from io import BytesIO
+from gtts import gTTS
 
-# ================== CONFIG ==================
+# ================= CONFIG =================
 
-BOT_TOKEN = os.getenv("8470101764:AAF2QWP9bPUwSwmDsKPrOFkGC0amvz3cWlw")
-GROQ_API_KEY = os.getenv("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")
-CRYPTO_PAY_TOKEN = os.getenv("600210:AAazektG1ofJzATQOO6WUN0Ft5kZYfz4MV8")
-
-BOT_NAME = "Jarvis"
-
-# ================== INIT ==================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+CRYPTO_PAY_TOKEN = os.getenv("CRYPTO_PAY_TOKEN")
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 groq = Groq(api_key=GROQ_API_KEY)
 
-db = sqlite3.connect("db.sqlite3")
-cursor = db.cursor()
+# ================= DB =================
 
-# ================== DB ==================
+db = sqlite3.connect("jarvis.db")
+cur = db.cursor()
 
-cursor.execute("""
+cur.execute("""
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
-    balance INTEGER DEFAULT 0,
-    model TEXT DEFAULT 'basic_1',
-    mood TEXT DEFAULT 'neutral',
-    emoji INTEGER DEFAULT 1,
-    role TEXT DEFAULT 'assistant',
-    memory TEXT DEFAULT '',
-    ref INTEGER
-)
-""")
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS payments (
-    invoice_id TEXT,
-    user_id INTEGER,
-    amount INTEGER
+    tier TEXT DEFAULT 'free',
+    messages_today INTEGER DEFAULT 0,
+    last_reset TEXT,
+    memory TEXT DEFAULT ''
 )
 """)
 
 db.commit()
 
-# ================== FSM ==================
+# ================= LIMITS =================
 
-class Settings(StatesGroup):
-    mood = State()
-    emoji = State()
-    role = State()
+LIMITS = {
+    "free": 20,
+    "pro": 100,
+    "ultra": 300
+}
 
-# ================== KEYBOARDS ==================
+# ================= UI =================
 
-def main_menu():
+def menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💬 Диалог", callback_data="chat")],
-        [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
-        [InlineKeyboardButton(text="💎 Версии ИИ", callback_data="models")],
-        [InlineKeyboardButton(text="💰 Баланс", callback_data="balance")],
-        [InlineKeyboardButton(text="🎁 Рефералы", callback_data="ref")]
+        [InlineKeyboardButton(text="💬 Чат", callback_data="chat")],
+        [InlineKeyboardButton(text="💎 Подписка", callback_data="subs")],
+        [InlineKeyboardButton(text="🎤 Голос режим", callback_data="voice")]
     ])
 
-def settings_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="😌 Настроение", callback_data="set_mood")],
-        [InlineKeyboardButton(text="✨ Эмодзи", callback_data="set_emoji")],
-        [InlineKeyboardButton(text="🗂 Роль (Секретарь)", callback_data="set_role")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")]
-    ])
+# ================= RESET LIMIT =================
 
-def models_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Basic 1", callback_data="model_basic_1")],
-        [InlineKeyboardButton(text="Basic 2", callback_data="model_basic_2")],
-        [InlineKeyboardButton(text="Pro 1", callback_data="model_pro_1")],
-        [InlineKeyboardButton(text="Pro 2", callback_data="model_pro_2")],
-        [InlineKeyboardButton(text="Ultra", callback_data="model_ultra")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")]
-    ])
+def reset_if_needed(uid):
+    cur.execute("SELECT last_reset FROM users WHERE user_id=?", (uid,))
+    row = cur.fetchone()
 
-# ================== START ==================
+    today = str(datetime.now().date())
+
+    if not row or row[0] != today:
+        cur.execute("""
+        UPDATE users
+        SET messages_today=0, last_reset=?
+        WHERE user_id=?
+        """, (today, uid))
+        db.commit()
+
+# ================= LIMIT CHECK =================
+
+def can_use(uid):
+    cur.execute("SELECT tier, messages_today FROM users WHERE user_id=?", (uid,))
+    tier, used = cur.fetchone()
+
+    reset_if_needed(uid)
+
+    return used < LIMITS[tier]
+
+# ================= INCREMENT =================
+
+def add_message(uid):
+    cur.execute("""
+    UPDATE users
+    SET messages_today = messages_today + 1
+    WHERE user_id=?
+    """, (uid,))
+    db.commit()
+
+# ================= CHAT =================
+
+async def ask_groq(text):
+    res = groq.chat.completions.create(
+        model="llama3-70b-8192",
+        messages=[{"role":"user","content":text}]
+    )
+    return res.choices[0].message.content
+
+# ================= START =================
 
 @dp.message(F.text == "/start")
 async def start(msg: Message):
-    ref = msg.text.split(" ")[1] if len(msg.text.split()) > 1 else None
-    cursor.execute("INSERT OR IGNORE INTO users(user_id, ref) VALUES (?,?)", (msg.from_user.id, ref))
+    cur.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (msg.from_user.id,))
     db.commit()
+
     await msg.answer(
-        f"👋 Привет! Я {BOT_NAME}.\n\n"
-        "Я умею помнить диалоги, быть секретарем, работать с голосом и изображениями.\n\n"
-        "Выбери действие 👇",
-        reply_markup=main_menu()
+        "🤖 JARVIS AI ONLINE\n\n"
+        "Я ассистент с памятью, голосом и подпиской.",
+        reply_markup=menu()
     )
 
-# ================== CALLBACKS ==================
-
-@dp.callback_query()
-async def callbacks(call: CallbackQuery, state: FSMContext):
-    data = call.data
-    uid = call.from_user.id
-
-    if data == "settings":
-        await call.message.edit_text("⚙️ Настройки", reply_markup=settings_menu())
-
-    elif data == "models":
-        await call.message.edit_text("💎 Выбор версии ИИ", reply_markup=models_menu())
-
-    elif data.startswith("model_"):
-        cursor.execute("UPDATE users SET model=? WHERE user_id=?", (data.replace("model_", ""), uid))
-        db.commit()
-        await call.answer("✅ Модель выбрана")
-
-    elif data == "balance":
-        cursor.execute("SELECT balance FROM users WHERE user_id=?", (uid,))
-        bal = cursor.fetchone()[0]
-        await call.message.answer(f"💰 Баланс: {bal}₽")
-
-    elif data == "ref":
-        await call.message.answer(
-            f"🎁 Твоя реферальная ссылка:\n"
-            f"https://t.me/{(await bot.me()).username}?start={uid}\n\n"
-            "Ты получаешь 20% с пополнений друзей."
-        )
-
-    elif data == "back":
-        await call.message.edit_text("Главное меню", reply_markup=main_menu())
-
-# ================== CHAT ==================
-
-async def summarize(memory):
-    prompt = f"Сделай краткое саммари:\n{memory}"
-    res = groq.chat.completions.create(
-        model="llama3-8b-8192",
-        messages=[{"role":"user","content":prompt}]
-    )
-    return res.choices[0].message.content[:800]
+# ================= CHAT =================
 
 @dp.message(F.text)
 async def chat(msg: Message):
     uid = msg.from_user.id
-    cursor.execute("SELECT memory, mood, emoji, role FROM users WHERE user_id=?", (uid,))
-    memory, mood, emoji, role = cursor.fetchone()
 
-    prompt = f"""
-Ты {role}.
-Настроение: {mood}.
-Эмодзи: {'да' if emoji else 'нет'}.
-Контекст:
-{memory}
+    if not can_use(uid):
+        await msg.answer("🚫 Лимит сообщений исчерпан. Оформи подписку 💎")
+        return
 
-Пользователь: {msg.text}
-"""
+    add_message(uid)
 
-    res = groq.chat.completions.create(
-        model="llama3-70b-8192",
-        messages=[{"role":"user","content":prompt}]
-    )
+    reply = await ask_groq(msg.text)
 
-    answer = res.choices[0].message.content
+    # voice reply optional (short)
+    tts = gTTS(reply[:200])
+    path = f"{uid}.mp3"
+    tts.save(path)
 
-    new_memory = memory + f"\nUser: {msg.text}\nJarvis: {answer}"
-    if len(new_memory) > 3000:
-        new_memory = await summarize(new_memory)
+    await msg.answer(reply)
+    await msg.answer_voice(open(path, "rb"))
 
-    cursor.execute("UPDATE users SET memory=? WHERE user_id=?", (new_memory, uid))
+# ================= VOICE INPUT =================
+
+@dp.message(F.voice)
+async def voice(msg: Message):
+    file = await bot.get_file(msg.voice.file_id)
+    path = f"{msg.from_user.id}.ogg"
+
+    await bot.download_file(file.file_path, path)
+
+    audio = open(path, "rb")
+
+    transcript = groq.audio.transcriptions.create(
+        file=audio,
+        model="whisper-large-v3"
+    ).text
+
+    await msg.answer(f"🎤 Ты сказал: {transcript}")
+
+    reply = await ask_groq(transcript)
+    await msg.answer(reply)
+
+# ================= SUBSCRIPTIONS =================
+
+@dp.callback_query(F.data == "subs")
+async def subs(cb: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Free", callback_data="tier_free")],
+        [InlineKeyboardButton(text="Pro - 5$", callback_data="tier_pro")],
+        [InlineKeyboardButton(text="Ultra - 10$", callback_data="tier_ultra")]
+    ])
+    await cb.message.answer("💎 Выбери подписку:", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("tier_"))
+async def set_tier(cb: CallbackQuery):
+    tier = cb.data.replace("tier_", "")
+
+    cur.execute("""
+    UPDATE users SET tier=? WHERE user_id=?
+    """, (tier, cb.from_user.id))
     db.commit()
 
-    await msg.answer(answer)
+    await cb.message.answer(f"✅ Подписка активирована: {tier.upper()}")
 
-# ================== IMAGE OCR ==================
-
-@dp.message(F.photo)
-async def image_handler(msg: Message):
-    file = await bot.get_file(msg.photo[-1].file_id)
-    data = await bot.download_file(file.file_path)
-    img = Image.open(BytesIO(data.read()))
-    text = pytesseract.image_to_string(img, lang="rus+eng")
-    await msg.answer(f"📄 Текст с картинки:\n{text}")
-
-# ================== CRYPTOPAY ==================
-
-async def create_invoice(uid, amount):
-    async with aiohttp.ClientSession() as s:
-        async with s.post(
-            "https://pay.crypt.bot/api/createInvoice",
-            headers={"Crypto-Pay-API-Token": CRYPTO_PAY_TOKEN},
-            json={"asset":"USDT","amount":amount}
-        ) as r:
-            return (await r.json())["result"]
-
-# ================== RUN ==================
+# ================= RUN =================
 
 async def main():
     await dp.start_polling(bot)
