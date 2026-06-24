@@ -2,7 +2,7 @@ import os
 import asyncio
 import sqlite3
 import aiohttp
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
@@ -29,23 +29,25 @@ cur.execute("""
 CREATE TABLE IF NOT EXISTS users(
     user_id INTEGER PRIMARY KEY,
     tier TEXT DEFAULT 'free',
+    expire TEXT DEFAULT '',
     messages INTEGER DEFAULT 0,
-    memory TEXT DEFAULT ''
+    memory TEXT DEFAULT '',
+    role TEXT DEFAULT 'assistant'
 )
 """)
 
 cur.execute("""
 CREATE TABLE IF NOT EXISTS invoices(
-    invoice_id TEXT,
+    invoice_id TEXT PRIMARY KEY,
     user_id INTEGER,
     tier TEXT,
-    status TEXT DEFAULT 'pending'
+    used INTEGER DEFAULT 0
 )
 """)
 
 db.commit()
 
-# ================= SAAS CONFIG =================
+# ================= LIMITS =================
 
 LIMITS = {
     "free": 15,
@@ -58,39 +60,40 @@ LIMITS = {
 def menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💬 Чат", callback_data="chat")],
-        [InlineKeyboardButton(text="💎 Подписка", callback_data="subs")]
+        [InlineKeyboardButton(text="💎 Подписка", callback_data="subs")],
+        [InlineKeyboardButton(text="🧠 Роль", callback_data="role")]
     ])
 
 def subs_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="PRO - $1", callback_data="buy_pro")],
-        [InlineKeyboardButton(text="ULTRA - $3", callback_data="buy_ultra")]
+        [InlineKeyboardButton(text="PRO 30d - $1", callback_data="buy_pro")],
+        [InlineKeyboardButton(text="ULTRA 30d - $3", callback_data="buy_ultra")]
     ])
 
-# ================= FAST AI =================
+# ================= AI =================
 
-async def ask_ai(text, memory):
-    def _call():
+async def ask_ai(text, memory, role):
+    prompt = f"""
+Role: {role}
+Memory: {memory}
+
+User: {text}
+"""
+
+    def call():
         return groq.chat.completions.create(
             model="llama3-70b-8192",
-            messages=[{"role": "user", "content": memory + "\nUser:" + text}]
+            messages=[{"role": "user", "content": prompt}]
         ).choices[0].message.content
 
-    return await asyncio.to_thread(_call)
+    return await asyncio.to_thread(call)
 
-# ================= LIMIT SYSTEM =================
+# ================= SUBS CHECK =================
 
-def check_limit(uid):
-    cur.execute("SELECT tier, messages FROM users WHERE user_id=?", (uid,))
-    tier, used = cur.fetchone()
-
-    if used >= LIMITS[tier]:
-        return False
-    return True
-
-def add_msg(uid):
-    cur.execute("UPDATE users SET messages = messages + 1 WHERE user_id=?", (uid,))
-    db.commit()
+def is_expired(expire_str):
+    if not expire_str:
+        return True
+    return datetime.utcnow() > datetime.fromisoformat(expire_str)
 
 # ================= START =================
 
@@ -98,7 +101,7 @@ def add_msg(uid):
 async def start(msg: Message):
     cur.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (msg.from_user.id,))
     db.commit()
-    await msg.answer("🤖 JARVIS SaaS ONLINE", reply_markup=menu())
+    await msg.answer("🤖 JARVIS SaaS 3.0 ONLINE", reply_markup=menu())
 
 # ================= CHAT =================
 
@@ -106,30 +109,31 @@ async def start(msg: Message):
 async def chat(msg: Message):
     uid = msg.from_user.id
 
-    if not check_limit(uid):
-        await msg.answer("🚫 Лимит исчерпан. Оформи подписку 💎")
+    cur.execute("SELECT tier, expire, memory, role, messages FROM users WHERE user_id=?", (uid,))
+    tier, expire, memory, role, used = cur.fetchone()
+
+    if tier != "free" and is_expired(expire):
+        tier = "free"
+        cur.execute("UPDATE users SET tier='free', expire='' WHERE user_id=?", (uid,))
+        db.commit()
+
+    if used >= LIMITS[tier]:
+        await msg.answer("🚫 Лимит исчерпан")
         return
 
-    add_msg(uid)
+    cur.execute("UPDATE users SET messages = messages + 1 WHERE user_id=?", (uid,))
+    db.commit()
 
-    cur.execute("SELECT memory FROM users WHERE user_id=?", (uid,))
-    memory = cur.fetchone()[0]
+    reply = await ask_ai(msg.text, memory, role)
 
-    reply = await ask_ai(msg.text, memory)
+    memory = (memory + f"\nU:{msg.text}\nA:{reply}")[-2500:]
 
-    # memory update (lightweight)
-    new_memory = memory + f"\nU:{msg.text}\nA:{reply}"
-    if len(new_memory) > 2000:
-        new_memory = new_memory[-2000:]
-
-    cur.execute("UPDATE users SET memory=? WHERE user_id=?", (new_memory, uid))
+    cur.execute("UPDATE users SET memory=? WHERE user_id=?", (memory, uid))
     db.commit()
 
     await msg.answer(reply)
 
-    # async voice (non-blocking)
     asyncio.create_task(send_voice(uid, reply))
-
 
 # ================= VOICE =================
 
@@ -138,12 +142,11 @@ async def send_voice(uid, text):
         tts = gTTS(text[:200])
         path = f"{uid}.mp3"
         tts.save(path)
-
         await bot.send_voice(uid, open(path, "rb"))
     except:
         pass
 
-# ================= SUBSCRIPTION FLOW =================
+# ================= SUBS =================
 
 @dp.callback_query(F.data == "subs")
 async def subs(c: CallbackQuery):
@@ -163,13 +166,12 @@ async def create_invoice(uid, tier, amount):
             data = await r.json()
             inv = data["result"]
 
-            cur.execute(
-                "INSERT INTO invoices VALUES (?,?,?,?)",
-                (inv["invoice_id"], uid, tier, "pending")
-            )
+            cur.execute("""
+            INSERT OR IGNORE INTO invoices VALUES (?,?,?,0)
+            """, (inv["invoice_id"], uid, tier))
             db.commit()
 
-            return inv["pay_url"]
+            return inv["pay_url"], inv["invoice_id"]
 
 @dp.callback_query(F.data.startswith("buy_"))
 async def buy(c: CallbackQuery):
@@ -180,15 +182,15 @@ async def buy(c: CallbackQuery):
         "ultra": 3
     }
 
-    url = await create_invoice(c.from_user.id, tier, prices[tier])
+    url, inv_id = await create_invoice(c.from_user.id, tier, prices[tier])
 
-    await c.message.answer(f"💳 Оплати:\n{url}")
+    await c.message.answer(f"💳 Оплата:\n{url}")
 
-# ================= PAYMENT CHECKER =================
+# ================= PAYMENT ENGINE =================
 
 async def payment_worker():
     while True:
-        await asyncio.sleep(10)
+        await asyncio.sleep(8)
 
         async with aiohttp.ClientSession() as s:
             async with s.get(
@@ -198,19 +200,32 @@ async def payment_worker():
                 data = await r.json()
 
         for inv in data["result"]["items"]:
-            if inv["status"] == "paid":
+            if inv["status"] != "paid":
+                continue
 
-                cur.execute(
-                    "SELECT user_id, tier FROM invoices WHERE invoice_id=?",
-                    (inv["invoice_id"],)
-                )
-                row = cur.fetchone()
+            cur.execute("SELECT used FROM invoices WHERE invoice_id=?", (inv["invoice_id"],))
+            row = cur.fetchone()
 
-                if row:
-                    uid, tier = row
+            if not row:
+                continue
 
-                    cur.execute("UPDATE users SET tier=? WHERE user_id=?", (tier, uid))
-                    db.commit()
+            # already processed
+            if row[0] == 1:
+                continue
+
+            cur.execute("SELECT user_id, tier FROM invoices WHERE invoice_id=?", (inv["invoice_id"],))
+            uid, tier = cur.fetchone()
+
+            expire = (datetime.utcnow() + timedelta(days=30)).isoformat()
+
+            cur.execute("""
+            UPDATE users
+            SET tier=?, expire=?
+            WHERE user_id=?
+            """, (tier, expire, uid))
+
+            cur.execute("UPDATE invoices SET used=1 WHERE invoice_id=?", (inv["invoice_id"],))
+            db.commit()
 
 # ================= RUN =================
 
